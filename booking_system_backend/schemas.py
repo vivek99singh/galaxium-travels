@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from models import WaitlistStatus
+
 # Seat class type definition
 SeatClass = Literal['economy', 'business', 'galaxium']
 
@@ -85,3 +87,38 @@ class ErrorResponse(BaseModel):
     error: str
     error_code: str
     details: str | None = None
+
+
+class WaitlistRequest(BaseModel):
+    user_id: int
+    name: str
+    flight_id: int
+    seat_class: SeatClass = 'economy'
+
+
+class WaitlistOut(BaseModel):
+    waitlist_id: int
+    user_id: int
+    flight_id: int
+    seat_class: SeatClass
+    status: WaitlistStatus
+    position: int
+    locked_price: int
+    created_at: str
+    offer_expires_at: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WaitlistActionRequest(BaseModel):
+    user_id: int
+
+
+class NotificationOut(BaseModel):
+    notification_id: int
+    user_id: int
+    type: str
+    message: str
+    created_at: str
+
+    model_config = ConfigDict(from_attributes=True)

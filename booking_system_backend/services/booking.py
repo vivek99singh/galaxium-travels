@@ -55,7 +55,7 @@ def book_flight(db: Session, user_id: int, name: str, flight_id: int, seat_class
             return ErrorResponse(
                 error="Name mismatch",
                 error_code="NAME_MISMATCH",
-                details=f"User ID {user_id} exists but the name '{name}' does not match the registered name '{existing_user.name}'. Please verify the user's name or use the correct name for this user ID."
+                details=f"User ID {user_id} exists but the name provided does not match our records. Please verify the name for this user ID."
             )
         else:
             return ErrorResponse(
@@ -118,6 +118,9 @@ def cancel_booking(db: Session, booking_id: int) -> BookingOut | ErrorResponse:
             flight.galaxium_seats_available += 1
 
     booking.status = "cancelled"
+    # Local import to avoid circular dependency (waitlist imports booking)
+    from services.waitlist import _offer_next_seat
+    _offer_next_seat(db, booking.flight_id, booking.seat_class)
     db.commit()
     db.refresh(booking)
     return BookingOut.model_validate(booking)

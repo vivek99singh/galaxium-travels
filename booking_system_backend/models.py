@@ -11,6 +11,14 @@ class BookingStatus(str, Enum):
     CANCELED = "cancelled"  # American spelling alias  # noqa: PIE796
     COMPLETED = "completed"
 
+class WaitlistStatus(str, Enum):
+    WAITING = "waiting"
+    OFFERED = "offered"  # a seat is held for this user until they accept or decline
+    PROMOTED = "promoted"  # the user accepted the offer and has a booking
+    DECLINED = "declined"
+    LEFT = "left"
+    EXPIRED = "expired"
+
 class User(Base):
     __tablename__ = 'users'
     user_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -38,3 +46,25 @@ class Booking(Base):
     booking_time = Column(String, nullable=False)
     seat_class = Column(String, nullable=False, default='economy')  # economy/business/galaxium
     price_paid = Column(Integer, nullable=False)  # Actual price at booking time
+
+
+class WaitlistEntry(Base):
+    __tablename__ = 'waitlist_entries'
+    waitlist_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.user_id'), nullable=False)
+    flight_id = Column(Integer, ForeignKey('flights.flight_id'), nullable=False)
+    seat_class = Column(String, nullable=False)
+    status = Column(String, nullable=False, default='waiting')
+    position = Column(Integer, nullable=False)
+    locked_price = Column(Integer, nullable=False)  # Price in cents at join time
+    created_at = Column(String, nullable=False)  # ISO timestamp
+    offer_expires_at = Column(String, nullable=True)  # ISO timestamp, set while status is 'offered'
+
+
+class Notification(Base):
+    __tablename__ = 'notifications'
+    notification_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.user_id'), nullable=False)
+    type = Column(String, nullable=False)
+    message = Column(String, nullable=False)
+    created_at = Column(String, nullable=False)  # ISO timestamp

@@ -3,9 +3,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models import Booking, Flight, User
+from models import Booking, Flight, Notification, User, WaitlistEntry
 from schemas import ErrorResponse
-from services import booking, flight, user
+from services import booking, flight, user, waitlist
 
 
 class TestFlightService:
@@ -367,6 +367,28 @@ class TestBookingService:
         assert isinstance(result, ErrorResponse)
         assert result.error_code == "NAME_MISMATCH"
 
+    def test_book_flight_name_mismatch_does_not_leak_stored_name(self, db_session):
+        """SR-1: NAME_MISMATCH details must not reveal the stored registered name."""
+        db_session.add(User(name="Secret Name", email="test@example.com"))
+        db_session.add(Flight(
+            origin="Earth",
+            destination="Mars",
+            departure_time="2099-01-01 09:00",
+            arrival_time="2099-01-01 17:00",
+            base_price=1000,
+            economy_seats_available=5,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+        user_obj = db_session.query(User).first()
+        flight_obj = db_session.query(Flight).first()
+
+        result = booking.book_flight(db_session, user_obj.user_id, "Wrong Name", flight_obj.flight_id)
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "NAME_MISMATCH"
+        assert "Secret Name" not in result.details
+
     def test_cancel_booking_success(self, db_session):
         """Test successful booking cancellation."""
         db_session.add(User(name="Test User", email="test@example.com"))
@@ -481,6 +503,333 @@ class TestBookingService:
         result = booking.get_bookings(db_session, 999)
         assert result == []
 
+    def test_cancel_booking_offers_seat_to_waitlist(self, db_session):
+        """Cancel with an active waitlist entry → seat is offered and held, no booking yet."""
+        db_session.add(User(name="Test User", email="test@example.com"))
+        db_session.add(User(name="Waiter User", email="waiter@example.com"))
+        db_session.add(Flight(
+            origin="Earth", destination="Mars",
+            departure_time="2099-01-01 09:00", arrival_time="2099-01-01 17:00",
+            base_price=1000000,
+            economy_seats_available=0,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+
+        user_obj = db_session.query(User).filter_by(email="test@example.com").first()
+        waiter = db_session.query(User).filter_by(email="waiter@example.com").first()
+        flight_obj = db_session.query(Flight).first()
+
+        db_session.add(Booking(
+            user_id=user_obj.user_id, flight_id=flight_obj.flight_id,
+            status="booked", booking_time="2099-01-01 10:00",
+            seat_class="economy", price_paid=1000000
+        ))
+        db_session.add(WaitlistEntry(
+            user_id=waiter.user_id, flight_id=flight_obj.flight_id,
+            seat_class="economy", status="waiting", position=1,
+            locked_price=1000000, created_at="2099-01-01 08:00"
+        ))
+        db_session.commit()
+
+        booking_obj = db_session.query(Booking).filter_by(user_id=user_obj.user_id).first()
+        result = booking.cancel_booking(db_session, booking_obj.booking_id)
+
+        assert result.status == "cancelled"
+        # Seat restored then held for the offer → stays at 0
+        db_session.refresh(flight_obj)
+        assert flight_obj.economy_seats_available == 0
+        # No booking until the waiter accepts
+        assert db_session.query(Booking).filter_by(user_id=waiter.user_id).first() is None
+        entry = db_session.query(WaitlistEntry).filter_by(user_id=waiter.user_id).first()
+        assert entry.status == "offered"
+        notes = db_session.query(Notification).filter_by(user_id=waiter.user_id).all()
+        assert [n.type for n in notes] == ["waitlist_offer"]
+
+    def test_cancel_booking_no_waitlist_restores_seat(self, db_session):
+        """Cancel with no waitlist entry → seat is simply restored (regression)."""
+        db_session.add(User(name="Test User", email="test@example.com"))
+        db_session.add(Flight(
+            origin="Earth", destination="Mars",
+            departure_time="2099-01-01 09:00", arrival_time="2099-01-01 17:00",
+            base_price=1000000,
+            economy_seats_available=4,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+
+        user_obj = db_session.query(User).first()
+        flight_obj = db_session.query(Flight).first()
+
+        db_session.add(Booking(
+            user_id=user_obj.user_id, flight_id=flight_obj.flight_id,
+            status="booked", booking_time="2099-01-01 10:00",
+            seat_class="economy", price_paid=1000000
+        ))
+        db_session.commit()
+
+        booking_obj = db_session.query(Booking).first()
+        result = booking.cancel_booking(db_session, booking_obj.booking_id)
+
+        assert result.status == "cancelled"
+        db_session.refresh(flight_obj)
+        assert flight_obj.economy_seats_available == 5
+
+
+class TestWaitlistService:
+    """Test waitlist service functions."""
+
+    def _make_full_flight(self, db_session):
+        """Helper: add a user and a sold-out economy flight, return (user, flight)."""
+        db_session.add(User(name="Test User", email="test@example.com"))
+        db_session.add(Flight(
+            origin="Earth", destination="Mars",
+            departure_time="2099-01-01 09:00", arrival_time="2099-01-01 17:00",
+            base_price=1000000,
+            economy_seats_available=0,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+        user_obj = db_session.query(User).first()
+        flight_obj = db_session.query(Flight).first()
+        return user_obj, flight_obj
+
+    def test_join_waitlist_success(self, db_session):
+        """Successfully join waitlist for a sold-out class."""
+        user_obj, flight_obj = self._make_full_flight(db_session)
+        result = waitlist.join_waitlist(db_session, user_obj.user_id, "Test User", flight_obj.flight_id, "economy")
+        assert not isinstance(result, ErrorResponse)
+        assert result.position == 1
+        assert result.status.value == "waiting"
+        assert result.seat_class == "economy"
+        assert result.locked_price == 1000000
+
+    def test_join_waitlist_seats_available(self, db_session):
+        """Returns SEATS_AVAILABLE when the class is not sold out."""
+        db_session.add(User(name="Test User", email="test@example.com"))
+        db_session.add(Flight(
+            origin="Earth", destination="Mars",
+            departure_time="2099-01-01 09:00", arrival_time="2099-01-01 17:00",
+            base_price=1000000,
+            economy_seats_available=5,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+        user_obj = db_session.query(User).first()
+        flight_obj = db_session.query(Flight).first()
+        result = waitlist.join_waitlist(db_session, user_obj.user_id, "Test User", flight_obj.flight_id, "economy")
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "SEATS_AVAILABLE"
+
+    def test_join_waitlist_flight_not_found(self, db_session):
+        """Returns FLIGHT_NOT_FOUND for unknown flight."""
+        db_session.add(User(name="Test User", email="test@example.com"))
+        db_session.commit()
+        user_obj = db_session.query(User).first()
+        result = waitlist.join_waitlist(db_session, user_obj.user_id, "Test User", 999, "economy")
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "FLIGHT_NOT_FOUND"
+
+    def test_join_waitlist_name_mismatch_does_not_leak_stored_name(self, db_session):
+        """SR-1: NAME_MISMATCH on join_waitlist must not reveal the stored registered name."""
+        user_obj, flight_obj = self._make_full_flight(db_session)
+        result = waitlist.join_waitlist(db_session, user_obj.user_id, "Wrong Name", flight_obj.flight_id, "economy")
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "NAME_MISMATCH"
+        assert "Test User" not in result.details
+
+    def test_join_waitlist_duplicate(self, db_session):
+        """Returns ALREADY_WAITLISTED on a second join attempt for same flight+class."""
+        user_obj, flight_obj = self._make_full_flight(db_session)
+        waitlist.join_waitlist(db_session, user_obj.user_id, "Test User", flight_obj.flight_id, "economy")
+        result = waitlist.join_waitlist(db_session, user_obj.user_id, "Test User", flight_obj.flight_id, "economy")
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "ALREADY_WAITLISTED"
+
+    def test_get_waitlist_returns_entries(self, db_session):
+        """get_waitlist returns all entries for a user."""
+        user_obj, flight_obj = self._make_full_flight(db_session)
+        waitlist.join_waitlist(db_session, user_obj.user_id, "Test User", flight_obj.flight_id, "economy")
+        results = waitlist.get_waitlist(db_session, user_obj.user_id)
+        assert len(results) == 1
+        assert results[0].user_id == user_obj.user_id
+
+    def test_get_waitlist_empty(self, db_session):
+        """get_waitlist returns empty list when user has no entries."""
+        assert waitlist.get_waitlist(db_session, 999) == []
+
+
+class TestWaitlistOfferFlow:
+    """Test offer, accept, decline and leave on the waitlist."""
+
+    def _setup(self, db_session, waiters=2):
+        """A sold-out economy flight, one booked user, and `waiters` users queued in order."""
+        db_session.add(User(name="Booker", email="booker@example.com"))
+        for i in range(waiters):
+            db_session.add(User(name=f"Waiter {i + 1}", email=f"waiter{i + 1}@example.com"))
+        db_session.add(Flight(
+            origin="Earth", destination="Mars",
+            departure_time="2099-01-01 09:00", arrival_time="2099-01-01 17:00",
+            base_price=1000000,
+            economy_seats_available=0,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+        booker = db_session.query(User).filter_by(email="booker@example.com").first()
+        flight_obj = db_session.query(Flight).first()
+        db_session.add(Booking(
+            user_id=booker.user_id, flight_id=flight_obj.flight_id,
+            status="booked", booking_time="2099-01-01 10:00",
+            seat_class="economy", price_paid=1000000
+        ))
+        db_session.commit()
+        entries = []
+        for i in range(waiters):
+            u = db_session.query(User).filter_by(email=f"waiter{i + 1}@example.com").first()
+            entries.append(waitlist.join_waitlist(db_session, u.user_id, u.name, flight_obj.flight_id, "economy"))
+        booking_obj = db_session.query(Booking).filter_by(user_id=booker.user_id).first()
+        return flight_obj, booking_obj, entries
+
+    def _entry(self, db_session, waitlist_id):
+        return db_session.query(WaitlistEntry).filter_by(waitlist_id=waitlist_id).first()
+
+    def test_accept_offer_creates_booking(self, db_session):
+        """Accepting an offer books the held seat at the locked price."""
+        flight_obj, booking_obj, (first, _) = self._setup(db_session)
+        booking.cancel_booking(db_session, booking_obj.booking_id)
+
+        result = waitlist.accept_offer(db_session, first.waitlist_id, first.user_id)
+
+        assert not isinstance(result, ErrorResponse)
+        assert result.status == "booked"
+        assert result.price_paid == first.locked_price
+        assert self._entry(db_session, first.waitlist_id).status == "promoted"
+        db_session.refresh(flight_obj)
+        assert flight_obj.economy_seats_available == 0
+        types = [n.type for n in db_session.query(Notification).filter_by(user_id=first.user_id)]
+        assert types == ["waitlist_offer", "waitlist_confirmed"]
+
+    def test_decline_offer_passes_seat_to_next(self, db_session):
+        """Declining an offer moves the offer to the next person in the queue."""
+        flight_obj, booking_obj, (first, second) = self._setup(db_session)
+        booking.cancel_booking(db_session, booking_obj.booking_id)
+
+        result = waitlist.decline_offer(db_session, first.waitlist_id, first.user_id)
+
+        assert not isinstance(result, ErrorResponse)
+        assert result.status.value == "declined"
+        assert self._entry(db_session, second.waitlist_id).status == "offered"
+        db_session.refresh(flight_obj)
+        assert flight_obj.economy_seats_available == 0
+
+    def test_decline_offer_with_nobody_waiting_releases_seat(self, db_session):
+        """Declining the last offer puts the seat back on sale."""
+        flight_obj, booking_obj, (first,) = self._setup(db_session, waiters=1)
+        booking.cancel_booking(db_session, booking_obj.booking_id)
+
+        waitlist.decline_offer(db_session, first.waitlist_id, first.user_id)
+
+        db_session.refresh(flight_obj)
+        assert flight_obj.economy_seats_available == 1
+
+    def test_leave_waitlist_moves_queue_up(self, db_session):
+        """Leaving while waiting moves everyone behind up one place."""
+        _, _, (first, second) = self._setup(db_session)
+
+        result = waitlist.leave_waitlist(db_session, first.waitlist_id, first.user_id)
+
+        assert result.status.value == "left"
+        assert self._entry(db_session, second.waitlist_id).position == 1
+
+    def test_leave_while_offered_passes_seat_to_next(self, db_session):
+        """Leaving while holding an offer passes the seat on."""
+        _, booking_obj, (first, second) = self._setup(db_session)
+        booking.cancel_booking(db_session, booking_obj.booking_id)
+
+        waitlist.leave_waitlist(db_session, first.waitlist_id, first.user_id)
+
+        assert self._entry(db_session, second.waitlist_id).status == "offered"
+
+    def test_accept_without_offer_fails(self, db_session):
+        """Accept is refused while the entry is still waiting."""
+        _, _, (first, _) = self._setup(db_session)
+        result = waitlist.accept_offer(db_session, first.waitlist_id, first.user_id)
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "INVALID_WAITLIST_STATUS"
+
+    def _expire(self, db_session, waitlist_id):
+        """Move an offer's deadline into the past."""
+        entry = self._entry(db_session, waitlist_id)
+        entry.offer_expires_at = "2000-01-01T00:00:00+00:00"
+        db_session.commit()
+
+    def test_offer_has_15_minute_deadline(self, db_session):
+        """An offer gets a deadline 15 minutes from now."""
+        from datetime import datetime, timedelta, timezone
+        _, booking_obj, (first, _) = self._setup(db_session)
+        booking.cancel_booking(db_session, booking_obj.booking_id)
+
+        deadline = datetime.fromisoformat(self._entry(db_session, first.waitlist_id).offer_expires_at)
+        expected = datetime.now(tz=timezone.utc) + timedelta(minutes=waitlist.OFFER_MINUTES)
+        assert abs((deadline - expected).total_seconds()) < 5
+
+    def test_expired_offer_passes_seat_to_next(self, db_session):
+        """An offer past its deadline expires and the next person gets the seat."""
+        flight_obj, booking_obj, (first, second) = self._setup(db_session)
+        booking.cancel_booking(db_session, booking_obj.booking_id)
+        self._expire(db_session, first.waitlist_id)
+
+        assert waitlist.expire_stale_offers(db_session) == 1
+
+        assert self._entry(db_session, first.waitlist_id).status == "expired"
+        assert self._entry(db_session, second.waitlist_id).status == "offered"
+        db_session.refresh(flight_obj)
+        assert flight_obj.economy_seats_available == 0
+        types = [n.type for n in db_session.query(Notification).filter_by(user_id=first.user_id)]
+        assert types == ["waitlist_offer", "waitlist_expired"]
+
+    def test_expired_offer_with_nobody_waiting_releases_seat(self, db_session):
+        """The last expired offer puts the seat back on sale."""
+        flight_obj, booking_obj, (first,) = self._setup(db_session, waiters=1)
+        booking.cancel_booking(db_session, booking_obj.booking_id)
+        self._expire(db_session, first.waitlist_id)
+
+        waitlist.expire_stale_offers(db_session)
+
+        db_session.refresh(flight_obj)
+        assert flight_obj.economy_seats_available == 1
+
+    def test_offer_within_deadline_is_kept(self, db_session):
+        """An offer still inside its 15 minutes is not expired."""
+        _, booking_obj, (first, _) = self._setup(db_session)
+        booking.cancel_booking(db_session, booking_obj.booking_id)
+
+        assert waitlist.expire_stale_offers(db_session) == 0
+        assert self._entry(db_session, first.waitlist_id).status == "offered"
+
+    def test_accept_after_deadline_fails(self, db_session):
+        """Accepting an expired offer is refused and creates no booking."""
+        _, booking_obj, (first, _) = self._setup(db_session)
+        booking.cancel_booking(db_session, booking_obj.booking_id)
+        self._expire(db_session, first.waitlist_id)
+
+        result = waitlist.accept_offer(db_session, first.waitlist_id, first.user_id)
+
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "OFFER_EXPIRED"
+        assert db_session.query(Booking).filter_by(user_id=first.user_id).first() is None
+
+    def test_action_on_other_users_entry_fails(self, db_session):
+        """A user cannot act on someone else's waitlist entry."""
+        _, _, (first, second) = self._setup(db_session)
+        result = waitlist.leave_waitlist(db_session, first.waitlist_id, second.user_id)
+        assert isinstance(result, ErrorResponse)
+        assert result.error_code == "NOT_OWNER"
 
 
 class TestFlightFiltering:

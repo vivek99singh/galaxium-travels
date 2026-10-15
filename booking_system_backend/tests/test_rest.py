@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models import Booking, Flight
+from models import Booking, Flight, WaitlistEntry
 
 
 class TestFlightsEndpoint:
@@ -422,6 +422,197 @@ class TestHealthEndpoint:
         response = client.get("/")
         assert response.status_code == 200
         assert response.json() == {"status": "OK"}
+
+
+class TestWaitlistEndpoint:
+    """Test /waitlist and /notifications endpoints."""
+
+    def _setup(self, client, db_session, sample_user_data):
+        """Register a user and create a sold-out flight; return (user_id, flight)."""
+        user_resp = client.post("/register", json=sample_user_data)
+        user_id = user_resp.json()["user_id"]
+        db_session.add(Flight(
+            origin="Earth", destination="Mars",
+            departure_time="2099-01-01 09:00", arrival_time="2099-01-01 17:00",
+            base_price=1000000,
+            economy_seats_available=0,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+        flight = db_session.query(Flight).first()
+        return user_id, flight
+
+    def test_join_waitlist_success(self, client, db_session, sample_user_data):
+        """POST /waitlist returns 201 and a waitlist entry."""
+        user_id, flight = self._setup(client, db_session, sample_user_data)
+        response = client.post("/waitlist", json={
+            "user_id": user_id,
+            "name": sample_user_data["name"],
+            "flight_id": flight.flight_id,
+            "seat_class": "economy",
+        })
+        assert response.status_code == 201
+        data = response.json()
+        assert data["position"] == 1
+        assert data["status"] == "waiting"
+        assert data["seat_class"] == "economy"
+
+    def test_join_waitlist_seats_available(self, client, db_session, sample_user_data):
+        """POST /waitlist returns 409 when seats are still available."""
+        user_resp = client.post("/register", json=sample_user_data)
+        user_id = user_resp.json()["user_id"]
+        db_session.add(Flight(
+            origin="Earth", destination="Mars",
+            departure_time="2099-01-01 09:00", arrival_time="2099-01-01 17:00",
+            base_price=1000000,
+            economy_seats_available=5,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+        flight = db_session.query(Flight).first()
+        response = client.post("/waitlist", json={
+            "user_id": user_id,
+            "name": sample_user_data["name"],
+            "flight_id": flight.flight_id,
+            "seat_class": "economy",
+        })
+        assert response.status_code == 409
+        assert response.json()["detail"]["error_code"] == "SEATS_AVAILABLE"
+
+    def test_get_waitlist(self, client, db_session, sample_user_data):
+        """GET /waitlist/{user_id} returns the user's waitlist entries."""
+        user_id, flight = self._setup(client, db_session, sample_user_data)
+        client.post("/waitlist", json={
+            "user_id": user_id,
+            "name": sample_user_data["name"],
+            "flight_id": flight.flight_id,
+            "seat_class": "economy",
+        })
+        response = client.get(f"/waitlist/{user_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["user_id"] == user_id
+
+    def test_get_notifications_after_offer(self, client, db_session, sample_user_data):
+        """GET /notifications/{user_id} returns an offer notification after a cancellation."""
+        from models import User, Booking
+        # Create two users: one with a booking, one on the waitlist
+        user_resp = client.post("/register", json=sample_user_data)
+        user_id = user_resp.json()["user_id"]
+        waiter_resp = client.post("/register", json={"name": "Waiter User", "email": "waiter@example.com"})
+        waiter_id = waiter_resp.json()["user_id"]
+
+        db_session.add(Flight(
+            origin="Earth", destination="Mars",
+            departure_time="2099-01-01 09:00", arrival_time="2099-01-01 17:00",
+            base_price=1000000,
+            economy_seats_available=0,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+        flight = db_session.query(Flight).first()
+
+        # Give the first user a booking and the waiter a waitlist entry
+        db_session.add(Booking(
+            user_id=user_id, flight_id=flight.flight_id,
+            status="booked", booking_time="2099-01-01 10:00",
+            seat_class="economy", price_paid=1000000
+        ))
+        db_session.add(WaitlistEntry(
+            user_id=waiter_id, flight_id=flight.flight_id,
+            seat_class="economy", status="waiting", position=1,
+            locked_price=1000000, created_at="2099-01-01 08:00"
+        ))
+        db_session.commit()
+        booking_obj = db_session.query(Booking).filter_by(user_id=user_id).first()
+
+        # Cancel triggers an offer
+        cancel_resp = client.post(f"/cancel/{booking_obj.booking_id}")
+        assert cancel_resp.status_code == 200
+
+        # Waiter should now have an offer notification
+        notif_resp = client.get(f"/notifications/{waiter_id}")
+        assert notif_resp.status_code == 200
+        data = notif_resp.json()
+        assert len(data) == 1
+        assert data[0]["type"] == "waitlist_offer"
+
+        # Accepting the offer returns a booking
+        entry = db_session.query(WaitlistEntry).filter_by(user_id=waiter_id).first()
+        accept_resp = client.post(f"/waitlist/{entry.waitlist_id}/accept", json={"user_id": waiter_id})
+        assert accept_resp.status_code == 200
+        assert accept_resp.json()["status"] == "booked"
+
+    def test_expired_offer_cannot_be_accepted(self, client, db_session, sample_user_data):
+        """An offer past its deadline shows as expired and accept returns 409 OFFER_EXPIRED."""
+        user_resp = client.post("/register", json=sample_user_data)
+        user_id = user_resp.json()["user_id"]
+        waiter_id = client.post("/register", json={"name": "Waiter User", "email": "waiter@example.com"}).json()["user_id"]
+        db_session.add(Flight(
+            origin="Earth", destination="Mars",
+            departure_time="2099-01-01 09:00", arrival_time="2099-01-01 17:00",
+            base_price=1000000,
+            economy_seats_available=0,
+            business_seats_available=3,
+            galaxium_seats_available=1
+        ))
+        db_session.commit()
+        flight = db_session.query(Flight).first()
+        db_session.add(Booking(
+            user_id=user_id, flight_id=flight.flight_id,
+            status="booked", booking_time="2099-01-01 10:00",
+            seat_class="economy", price_paid=1000000
+        ))
+        db_session.add(WaitlistEntry(
+            user_id=waiter_id, flight_id=flight.flight_id,
+            seat_class="economy", status="waiting", position=1,
+            locked_price=1000000, created_at="2099-01-01 08:00"
+        ))
+        db_session.commit()
+        booking_obj = db_session.query(Booking).filter_by(user_id=user_id).first()
+        client.post(f"/cancel/{booking_obj.booking_id}")
+
+        entry = db_session.query(WaitlistEntry).filter_by(user_id=waiter_id).first()
+        assert client.get(f"/waitlist/{waiter_id}").json()[0]["offer_expires_at"] is not None
+        entry.offer_expires_at = "2000-01-01T00:00:00+00:00"
+        db_session.commit()
+
+        assert client.get(f"/waitlist/{waiter_id}").json()[0]["status"] == "expired"
+        response = client.post(f"/waitlist/{entry.waitlist_id}/accept", json={"user_id": waiter_id})
+        assert response.status_code == 409
+        assert response.json()["detail"]["error_code"] == "OFFER_EXPIRED"
+        # The seat went back on sale because nobody else was waiting
+        assert client.get("/flights").json()[0]["economy_seats_available"] == 1
+
+    def test_leave_waitlist_endpoint(self, client, db_session, sample_user_data):
+        """POST /waitlist/{id}/leave marks the entry as left."""
+        user_id, flight = self._setup(client, db_session, sample_user_data)
+        join = client.post("/waitlist", json={
+            "user_id": user_id,
+            "name": sample_user_data["name"],
+            "flight_id": flight.flight_id,
+            "seat_class": "economy",
+        }).json()
+        response = client.post(f"/waitlist/{join['waitlist_id']}/leave", json={"user_id": user_id})
+        assert response.status_code == 200
+        assert response.json()["status"] == "left"
+
+    def test_accept_without_offer_returns_409(self, client, db_session, sample_user_data):
+        """POST /waitlist/{id}/accept returns 409 when there is no open offer."""
+        user_id, flight = self._setup(client, db_session, sample_user_data)
+        join = client.post("/waitlist", json={
+            "user_id": user_id,
+            "name": sample_user_data["name"],
+            "flight_id": flight.flight_id,
+            "seat_class": "economy",
+        }).json()
+        response = client.post(f"/waitlist/{join['waitlist_id']}/accept", json={"user_id": user_id})
+        assert response.status_code == 409
+        assert response.json()["detail"]["error_code"] == "INVALID_WAITLIST_STATUS"
 
 
 

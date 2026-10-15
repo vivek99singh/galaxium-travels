@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import type { Flight, SeatClass, Quote, Hold } from '../../types';
+import type { Flight, SeatClass, Quote, Hold, WaitlistEntry } from '../../types';
 import { Modal, Button } from '../common';
 import {
   Plane,
@@ -13,7 +13,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { formatCurrency, formatDate, calculateDuration } from '../../utils/formatters';
-import { createQuote, createHold, confirmHold, releaseHold } from '../../services/api';
+import { createQuote, createHold, confirmHold, releaseHold, joinWaitlist } from '../../services/api';
 import { storeHold, removeHold } from '../../utils/holdStorage';
 import { useUser } from '../../hooks/useUserContext';
 import toast from 'react-hot-toast';
@@ -24,10 +24,11 @@ interface BookingModalProps {
   isOpen: boolean;
   onClose: () => void;
   flight: Flight | null;
+  initialClass?: SeatClass;
   onSuccess: () => void;
 }
 
-export const BookingModal = ({ isOpen, onClose, flight, onSuccess }: BookingModalProps) => {
+export const BookingModal = ({ isOpen, onClose, flight, initialClass, onSuccess }: BookingModalProps) => {
   const { user } = useUser();
   const [step, setStep] = useState<Step>('select');
   const [selectedClass, setSelectedClass] = useState<SeatClass>('economy');
@@ -35,17 +36,21 @@ export const BookingModal = ({ isOpen, onClose, flight, onSuccess }: BookingModa
   const [quote, setQuote] = useState<Quote | null>(null);
   const [hold, setHold] = useState<Hold | null>(null);
   const [timeLeft, setTimeLeft] = useState(0);
+  const [waitlistSuccess, setWaitlistSuccess] = useState<WaitlistEntry | null>(null);
+  const [waitlistError, setWaitlistError] = useState<string | null>(null);
 
   // Reset state when modal opens
   useEffect(() => {
     if (isOpen) {
       setStep('select');
-      setSelectedClass('economy');
+      setSelectedClass(initialClass ?? 'economy');
       setQuote(null);
       setHold(null);
       setTimeLeft(0);
+      setWaitlistSuccess(null);
+      setWaitlistError(null);
     }
-  }, [isOpen]);
+  }, [isOpen, initialClass]);
 
   // Countdown timer
   useEffect(() => {
@@ -141,6 +146,34 @@ export const BookingModal = ({ isOpen, onClose, flight, onSuccess }: BookingModa
       </div>
     </div>
   );
+
+  const handleJoinWaitlist = async () => {
+    if (!user) {
+      toast.error('Please sign in to join the waitlist');
+      return;
+    }
+
+    setIsLoading(true);
+    setWaitlistError(null);
+    try {
+      const result = await joinWaitlist({
+        user_id: user.user_id,
+        name: user.name,
+        flight_id: flight.flight_id,
+        seat_class: selectedClass,
+      });
+      if ('waitlist_id' in result) {
+        setWaitlistSuccess(result);
+        toast.success(`You're #${result.position} on the waitlist!`);
+      } else {
+        setWaitlistError(result.details || result.error);
+      }
+    } catch {
+      setWaitlistError('Failed to join waitlist. Please try again.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   const handleGetQuote = async () => {
     if (!user) {
@@ -257,13 +290,12 @@ export const BookingModal = ({ isOpen, onClose, flight, onSuccess }: BookingModa
             return (
               <button
                 key={sc.class}
-                onClick={() => !isSoldOut && setSelectedClass(sc.class)}
-                disabled={isSoldOut}
+                onClick={() => setSelectedClass(sc.class)}
                 className={`w-full p-4 rounded-lg border-2 transition-all text-left ${
                   isSelected
                     ? `${sc.borderColor} ${sc.bgColor}`
                     : 'border-white/10 bg-white/5 hover:border-white/20'
-                } ${isSoldOut ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                } ${isSoldOut ? 'opacity-60 cursor-pointer' : 'cursor-pointer'}`}
               >
                 <div className="flex items-start justify-between mb-2">
                   <div className="flex items-center gap-2">
@@ -299,14 +331,42 @@ export const BookingModal = ({ isOpen, onClose, flight, onSuccess }: BookingModa
         </div>
       )}
 
-      <div className="flex gap-3">
-        <Button variant="secondary" onClick={onClose} disabled={isLoading} className="flex-1">
-          Cancel
-        </Button>
-        <Button onClick={handleGetQuote} isLoading={isLoading} className="flex-1">
-          Get Quote →
-        </Button>
-      </div>
+      {waitlistSuccess ? (
+        <div className="p-4 rounded-lg bg-alien-green/10 border border-alien-green/30 text-center space-y-2">
+          <p className="text-alien-green font-semibold text-lg">
+            You're #{waitlistSuccess.position} on the waitlist!
+          </p>
+          <p className="text-star-white/60 text-sm">
+            We'll notify you when a seat opens up.
+          </p>
+          <Button variant="secondary" onClick={onClose} className="w-full mt-2">
+            Close
+          </Button>
+        </div>
+      ) : selectedClassData?.seats === 0 ? (
+        <div className="space-y-3">
+          {waitlistError && (
+            <p className="text-red-400 text-sm text-center">{waitlistError}</p>
+          )}
+          <div className="flex gap-3">
+            <Button variant="secondary" onClick={onClose} disabled={isLoading} className="flex-1">
+              Cancel
+            </Button>
+            <Button onClick={handleJoinWaitlist} isLoading={isLoading} className="flex-1">
+              Join Waitlist
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex gap-3">
+          <Button variant="secondary" onClick={onClose} disabled={isLoading} className="flex-1">
+            Cancel
+          </Button>
+          <Button onClick={handleGetQuote} isLoading={isLoading} className="flex-1">
+            Get Quote →
+          </Button>
+        </div>
+      )}
     </div>
   );
 
