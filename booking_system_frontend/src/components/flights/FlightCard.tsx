@@ -8,7 +8,7 @@ import { getDestinationByName } from '../../data/destinations';
 
 interface FlightCardProps {
   flight: Flight;
-  onBook: (flight: Flight) => void;
+  onBook: (flight: Flight, seatClass?: SeatClass) => void;
 }
 
 export const FlightCard = ({ flight, onBook }: FlightCardProps) => {
@@ -128,11 +128,9 @@ export const FlightCard = ({ flight, onBook }: FlightCardProps) => {
               return (
                 <div
                   key={seatClass.class}
-                  className={`p-3 rounded-lg border ${seatClass.borderColor} ${seatClass.bgColor} ${
-                    isClassSoldOut ? 'opacity-50' : ''
-                  }`}
+                  className={`p-3 rounded-lg border ${seatClass.borderColor} ${seatClass.bgColor}`}
                 >
-                  <div className="flex items-center justify-between">
+                  <div className={`flex items-center justify-between ${isClassSoldOut ? 'opacity-50' : ''}`}>
                     <div className="flex items-center gap-2">
                       <Icon size={18} className={seatClass.color} />
                       <span className="font-medium text-star-white">{seatClass.name}</span>
@@ -149,6 +147,18 @@ export const FlightCard = ({ flight, onBook }: FlightCardProps) => {
                       </div>
                     </div>
                   </div>
+                  {isClassSoldOut && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onBook(flight, seatClass.class);
+                      }}
+                      className="mt-2 w-full rounded-md border border-solar-orange/60 bg-solar-orange/10 px-3 py-1.5 text-sm font-semibold text-solar-orange hover:bg-solar-orange/20 transition-colors"
+                    >
+                      Join Waitlist
+                    </button>
+                  )}
                 </div>
               );
             })}
@@ -157,11 +167,10 @@ export const FlightCard = ({ flight, onBook }: FlightCardProps) => {
 
         {/* Book Button */}
         <Button
-          onClick={() => onBook(flight)}
-          disabled={isSoldOut}
+          onClick={() => onBook(flight, isSoldOut ? 'economy' : undefined)}
           className="w-full"
         >
-          {isSoldOut ? 'All Classes Sold Out' : 'Select Seat Class'}
+          {isSoldOut ? 'All Classes Sold Out: Join Waitlist' : 'Select Seat Class'}
         </Button>
       </Card>
     </motion.div>

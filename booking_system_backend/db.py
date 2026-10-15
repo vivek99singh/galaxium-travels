@@ -1,6 +1,6 @@
 import os
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from models import Base
@@ -25,6 +25,18 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _add_missing_columns()
+
+
+def _add_missing_columns():
+    """create_all() doesn't add columns to existing tables; add the ones added since."""
+    insp = inspect(engine)
+    if 'waitlist_entries' not in insp.get_table_names():
+        return
+    columns = {c['name'] for c in insp.get_columns('waitlist_entries')}
+    if 'offer_expires_at' not in columns:
+        with engine.begin() as conn:
+            conn.execute(text('ALTER TABLE waitlist_entries ADD COLUMN offer_expires_at VARCHAR'))
 
 def get_db():
     db = SessionLocal()

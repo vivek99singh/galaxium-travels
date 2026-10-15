@@ -8,6 +8,9 @@ import type {
   ErrorResponse,
   Quote,
   Hold,
+  WaitlistEntry,
+  WaitlistRequest,
+  AppNotification,
 } from '../types';
 
 // Create axios instance with base configuration
@@ -143,6 +146,75 @@ export const cancelBooking = async (
   const response = await api.post<Booking | ErrorResponse>(
     `/cancel/${bookingId}`
   );
+  return response.data;
+};
+
+// ==================== Waitlist Endpoints ====================
+
+/**
+ * Join the waitlist for a sold-out seat class on a flight
+ */
+export const joinWaitlist = async (
+  data: WaitlistRequest
+): Promise<WaitlistEntry | ErrorResponse> => {
+  const response = await api.post<WaitlistEntry | ErrorResponse>('/waitlist', data);
+  return response.data;
+};
+
+/**
+ * Get all waitlist entries for a user
+ */
+export const getUserWaitlist = async (userId: number): Promise<WaitlistEntry[]> => {
+  const response = await api.get<WaitlistEntry[]>(`/waitlist/${userId}`);
+  return response.data;
+};
+
+/**
+ * Accept a seat offer from the waitlist (creates a booking)
+ */
+export const acceptWaitlistOffer = async (
+  waitlistId: number,
+  userId: number
+): Promise<Booking | ErrorResponse> => {
+  const response = await api.post<Booking | ErrorResponse>(`/waitlist/${waitlistId}/accept`, {
+    user_id: userId,
+  });
+  return response.data;
+};
+
+/**
+ * Decline a seat offer from the waitlist
+ */
+export const declineWaitlistOffer = async (
+  waitlistId: number,
+  userId: number
+): Promise<WaitlistEntry | ErrorResponse> => {
+  const response = await api.post<WaitlistEntry | ErrorResponse>(`/waitlist/${waitlistId}/decline`, {
+    user_id: userId,
+  });
+  return response.data;
+};
+
+/**
+ * Leave the waitlist
+ */
+export const leaveWaitlist = async (
+  waitlistId: number,
+  userId: number
+): Promise<WaitlistEntry | ErrorResponse> => {
+  const response = await api.post<WaitlistEntry | ErrorResponse>(`/waitlist/${waitlistId}/leave`, {
+    user_id: userId,
+  });
+  return response.data;
+};
+
+// ==================== Notification Endpoints ====================
+
+/**
+ * Get a user's notifications, newest first
+ */
+export const getUserNotifications = async (userId: number): Promise<AppNotification[]> => {
+  const response = await api.get<AppNotification[]>(`/notifications/${userId}`);
   return response.data;
 };
 

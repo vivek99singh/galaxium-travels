@@ -14,11 +14,15 @@ from schemas import (
     BookingRequest,
     ErrorResponse,
     FlightOut,
+    NotificationOut,
     UserOut,
     UserRegistration,
+    WaitlistActionRequest,
+    WaitlistOut,
+    WaitlistRequest,
 )
 from seed import seed
-from services import booking, flight, user
+from services import booking, flight, user, waitlist
 
 # Load environment variables from .env file
 load_dotenv()
@@ -61,6 +65,12 @@ app.add_middleware(
 )
 
 
+def get_db_fresh(db: Session = Depends(get_db)):
+    """A DB session with expired waitlist offers already handed on to the next person."""
+    waitlist.expire_stale_offers(db)
+    return db
+
+
 @app.get("/", tags=["Health"])
 def health_check():
     """Health check endpoint."""
@@ -92,7 +102,7 @@ def get_flights(
     min_seats_available: int | None = None,
     # Phase 3: Popular Routes from feature branch
     route_category: str | None = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db_fresh)
 ):
     """List all available flights with optional filtering and sorting.
     
@@ -150,7 +160,7 @@ def get_flights(
 
 
 @app.post("/book", response_model=BookingOut, tags=["Bookings"])
-def book_flight_endpoint(request: BookingRequest, db: Session = Depends(get_db)):
+def book_flight_endpoint(request: BookingRequest, db: Session = Depends(get_db_fresh)):
     """Book a seat on a specific flight for a user in the specified seat class.
 
     Requires user_id, name, and flight_id.
@@ -167,13 +177,86 @@ def book_flight_endpoint(request: BookingRequest, db: Session = Depends(get_db))
 
 
 @app.get("/bookings/{user_id}", response_model=list[BookingOut], tags=["Bookings"])
-def get_user_bookings(user_id: int, db: Session = Depends(get_db)):
+def get_user_bookings(user_id: int, db: Session = Depends(get_db_fresh)):
     """Retrieve all bookings for a specific user by user_id."""
     return booking.get_bookings(db, user_id)
 
 
+@app.post("/waitlist", response_model=WaitlistOut, status_code=201, tags=["Waitlist"])
+def join_waitlist_endpoint(request: WaitlistRequest, db: Session = Depends(get_db_fresh)):
+    """Join the waitlist for a sold-out seat class on a flight.
+
+    Returns 404 for unknown flight or user, 409 if seats are still available,
+    name mismatches, or the user is already waitlisted.
+    """
+    result = waitlist.join_waitlist(db, request.user_id, request.name, request.flight_id, request.seat_class)
+    if isinstance(result, ErrorResponse):
+        status = 404 if result.error_code in ("FLIGHT_NOT_FOUND", "USER_NOT_FOUND") else 409
+        raise HTTPException(status_code=status, detail=result.model_dump())
+    return result
+
+
+@app.get("/waitlist/{user_id}", response_model=list[WaitlistOut], tags=["Waitlist"])
+def get_user_waitlist(user_id: int, db: Session = Depends(get_db_fresh)):
+    """Retrieve all waitlist entries for a specific user by user_id."""
+    return waitlist.get_waitlist(db, user_id)
+
+
+WAITLIST_ERROR_STATUS = {
+    "WAITLIST_NOT_FOUND": 404, "NOT_OWNER": 403, "INVALID_WAITLIST_STATUS": 409, "OFFER_EXPIRED": 409,
+}
+
+
+def _raise_waitlist_error(result: ErrorResponse):
+    raise HTTPException(status_code=WAITLIST_ERROR_STATUS.get(result.error_code, 400), detail=result.model_dump())
+
+
+@app.post("/waitlist/{waitlist_id}/accept", response_model=BookingOut, tags=["Waitlist"])
+def accept_waitlist_offer(waitlist_id: int, request: WaitlistActionRequest, db: Session = Depends(get_db_fresh)):
+    """Accept a seat offer from the waitlist. Creates a booking at the locked price.
+
+    Returns 404 if the entry is unknown, 403 if it belongs to another user,
+    409 if the entry has no open offer.
+    """
+    result = waitlist.accept_offer(db, waitlist_id, request.user_id)
+    if isinstance(result, ErrorResponse):
+        _raise_waitlist_error(result)
+    return result
+
+
+@app.post("/waitlist/{waitlist_id}/decline", response_model=WaitlistOut, tags=["Waitlist"])
+def decline_waitlist_offer(waitlist_id: int, request: WaitlistActionRequest, db: Session = Depends(get_db_fresh)):
+    """Decline a seat offer. The seat is offered to the next person waiting."""
+    result = waitlist.decline_offer(db, waitlist_id, request.user_id)
+    if isinstance(result, ErrorResponse):
+        _raise_waitlist_error(result)
+    return result
+
+
+@app.post("/waitlist/{waitlist_id}/leave", response_model=WaitlistOut, tags=["Waitlist"])
+def leave_waitlist_endpoint(waitlist_id: int, request: WaitlistActionRequest, db: Session = Depends(get_db_fresh)):
+    """Leave the waitlist. Works while waiting or while holding an offer."""
+    result = waitlist.leave_waitlist(db, waitlist_id, request.user_id)
+    if isinstance(result, ErrorResponse):
+        _raise_waitlist_error(result)
+    return result
+
+
+@app.get("/notifications/{user_id}", response_model=list[NotificationOut], tags=["Notifications"])
+def get_user_notifications(user_id: int, db: Session = Depends(get_db_fresh)):
+    """Retrieve all notifications for a specific user by user_id, newest first."""
+    from models import Notification
+    notifications = (
+        db.query(Notification)
+        .filter(Notification.user_id == user_id)
+        .order_by(Notification.notification_id.desc())
+        .all()
+    )
+    return [NotificationOut.model_validate(n) for n in notifications]
+
+
 @app.post("/cancel/{booking_id}", response_model=BookingOut, tags=["Bookings"])
-def cancel_booking_endpoint(booking_id: int, db: Session = Depends(get_db)):
+def cancel_booking_endpoint(booking_id: int, db: Session = Depends(get_db_fresh)):
     """Cancel an existing booking by its booking_id.
 
     Increments available seats for the flight if successful.
@@ -219,7 +302,7 @@ JAVA_SERVICE_URL = os.getenv("JAVA_SERVICE_URL", "http://localhost:8080")
 
 
 @app.post("/internal/bookings/from-hold", response_model=BookingOut, tags=["Internal"])
-def create_booking_from_hold(hold_data: dict, db: Session = Depends(get_db)):
+def create_booking_from_hold(hold_data: dict, db: Session = Depends(get_db_fresh)):
     """Internal endpoint for Java hold service to create bookings.
 
     This endpoint is called by the Java inventory hold service when confirming a hold.

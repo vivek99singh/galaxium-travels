@@ -53,6 +53,33 @@ export interface ErrorResponse {
   details?: string;
 }
 
+export interface WaitlistEntry {
+  waitlist_id: number;
+  user_id: number;
+  flight_id: number;
+  seat_class: SeatClass;
+  status: 'waiting' | 'offered' | 'promoted' | 'declined' | 'left' | 'expired';
+  position: number;
+  locked_price: number;
+  created_at: string;
+  offer_expires_at?: string | null;
+}
+
+export interface AppNotification {
+  notification_id: number;
+  user_id: number;
+  type: string;
+  message: string;
+  created_at: string;
+}
+
+export interface WaitlistRequest {
+  user_id: number;
+  name: string;
+  flight_id: number;
+  seat_class: SeatClass;
+}
+
 // Extended types for UI
 export interface BookingWithFlight extends Booking {
   flight?: Flight;
